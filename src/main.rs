@@ -11,6 +11,69 @@ use actix_web::{
 };
 use serde::{Deserialize, Serialize};
 
+// Simple test function to verify parsing logic
+fn test_package_parsing() {
+    let test_cases = vec![
+        ("hello-world-1.0.0-x86_64.pax", ("hello-world", "1.0.0", Some("x86_64".to_string()))),
+        ("simple-package-2.1.0.pax", ("simple-package", "2.1.0", None)),
+        ("no-version-arch.pax", ("no-version-arch", "1.0.0", None)),
+        ("package-with-many-dashes-1.2.3-x86_64.pax", ("package-with-many-dashes", "1.2.3", Some("x86_64".to_string()))),
+    ];
+
+    for (filename, expected) in test_cases {
+        println!("Testing: {}", filename);
+        let filename_without_ext = filename.strip_suffix(".pax").unwrap_or(filename);
+        let parts: Vec<&str> = filename_without_ext.split('-').collect();
+
+        if parts.len() >= 2 {
+            // Check if the last part is a known architecture
+            let (architecture, remaining_parts) = if parts.len() >= 3 {
+                match parts[parts.len() - 1] {
+                    "x86_64" | "aarch64" | "arm64" => {
+                        (Some(parts[parts.len() - 1].to_string()), &parts[..parts.len() - 1])
+                    }
+                    _ => (None, parts.as_slice())
+                }
+            } else {
+                (None, parts.as_slice())
+            };
+
+            // For the remaining parts, identify version vs name
+            let (pkg_name, pkg_version) = if remaining_parts.len() >= 2 {
+                // Check if the last remaining part looks like a version
+                let last_part = remaining_parts[remaining_parts.len() - 1];
+                let is_version_like = last_part.chars().all(|c| c.is_ascii_digit() || c == '.')
+                    && last_part.contains('.')
+                    && !last_part.starts_with('.') && !last_part.ends_with('.');
+
+                if is_version_like {
+                    // Last part is version, everything before is name
+                    let name_parts: Vec<&str> = remaining_parts[..remaining_parts.len() - 1].to_vec();
+                    let pkg_name = name_parts.join("-");
+                    (pkg_name, last_part.to_string())
+                } else {
+                    // Last part is part of name, join all as name and use default version
+                    let pkg_name = remaining_parts.join("-");
+                    (pkg_name, "1.0.0".to_string())
+                }
+            } else {
+                // Only one part, use it as name with default version
+                (remaining_parts[0].to_string(), "1.0.0".to_string())
+            };
+
+            println!("  Result: name='{}', version='{}', arch='{:?}'", pkg_name, pkg_version, architecture);
+            println!("  Expected: name='{}', version='{}', arch='{:?}'",
+                     expected.0, expected.1, expected.2);
+
+            assert_eq!(pkg_name, expected.0);
+            assert_eq!(pkg_version, expected.1);
+            assert_eq!(architecture, expected.2);
+            println!("  ✓ PASS");
+        }
+        println!();
+    }
+}
+
 // Helper function to calculate file hash (simple implementation)
 fn calculate_hash(path: &Path) -> String {
     use std::collections::hash_map::DefaultHasher;
@@ -25,22 +88,30 @@ fn scan_packages_directory(directory: &Path) -> Result<MultiDistroRepository, Bo
     let mut distros = Vec::new();
 
     // Scan for subdirectories in the packages directory (each represents a distro)
+    eprintln!("Scanning packages directory: {:?}", directory);
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
+        eprintln!("Found entry: {:?}", path);
 
         if path.is_dir() {
+            eprintln!("Entry is a directory: {:?}", path);
             if let Some(distro_name) = path.file_name().and_then(|n| n.to_str()) {
+                eprintln!("Distro name: {}", distro_name);
                 // Scan for .pax files in this distro directory
                 let mut packages = Vec::new();
 
                 for package_entry in fs::read_dir(&path)? {
                     let package_entry = package_entry?;
                     let package_path = package_entry.path();
+                    eprintln!("Found package entry: {:?}", package_path);
 
                     if package_path.is_file() {
+                        eprintln!("Package entry is a file: {:?}", package_path);
                         if let Some(file_name) = package_path.file_name().and_then(|n| n.to_str()) {
+                            eprintln!("Package file name: {}", file_name);
                             if file_name.ends_with(".pax") {
+                                eprintln!("File ends with .pax, processing: {}", file_name);
                                 let file_size = fs::metadata(&package_path)?.len();
 
                                 // Parse package information from filename
@@ -51,20 +122,45 @@ fn scan_packages_directory(directory: &Path) -> Result<MultiDistroRepository, Bo
                                 let parts: Vec<&str> = filename_without_ext.split('-').collect();
 
                                 if parts.len() >= 2 {
-                                    let pkg_name = parts[0];
-                                    let pkg_version = parts[1];
-                                    let architecture = if parts.len() >= 3 {
-                                        match parts[2] {
-                                            "x86_64" | "aarch64" | "arm64" => Some(parts[2].to_string()),
-                                            _ => None,
+                                    // Check if the last part is a known architecture
+                                    let (architecture, remaining_parts) = if parts.len() >= 3 {
+                                        match parts[parts.len() - 1] {
+                                            "x86_64" | "aarch64" | "arm64" => {
+                                                (Some(parts[parts.len() - 1].to_string()), &parts[..parts.len() - 1])
+                                            }
+                                            _ => (None, parts.as_slice())
                                         }
                                     } else {
-                                        None
+                                        (None, parts.as_slice())
+                                    };
+
+                                    // For the remaining parts, identify version vs name
+                                    // The version is typically the last component that looks like semantic versioning
+                                    let (pkg_name, pkg_version) = if remaining_parts.len() >= 2 {
+                                        // Check if the last remaining part looks like a version
+                                        let last_part = remaining_parts[remaining_parts.len() - 1];
+                                        let is_version_like = last_part.chars().all(|c| c.is_ascii_digit() || c == '.')
+                                            && last_part.contains('.')
+                                            && !last_part.starts_with('.') && !last_part.ends_with('.');
+
+                                        if is_version_like {
+                                            // Last part is version, everything before is name
+                                            let name_parts: Vec<&str> = remaining_parts[..remaining_parts.len() - 1].to_vec();
+                                            let pkg_name = name_parts.join("-");
+                                            (pkg_name, last_part.to_string())
+                                        } else {
+                                            // Last part is part of name, join all as name and use default version
+                                            let pkg_name = remaining_parts.join("-");
+                                            (pkg_name, "1.0.0".to_string())
+                                        }
+                                    } else {
+                                        // Only one part, use it as name with default version
+                                        (remaining_parts[0].to_string(), "1.0.0".to_string())
                                     };
 
                                     packages.push(PackageEntry {
-                                        name: pkg_name.to_string(),
-                                        version: pkg_version.to_string(),
+                                        name: pkg_name.clone(),
+                                        version: pkg_version.clone(),
                                         architecture,
                                         description: format!("Package {} version {}", pkg_name, pkg_version),
                                         dependencies: Vec::new(),
@@ -214,8 +310,18 @@ struct CoreData {
     directory: PathBuf,
 }
 
+fn main() {
+    // Test the parsing logic first
+    test_package_parsing();
+    println!("All parsing tests passed!");
+
+    // Then run the server
+    println!("Starting server...");
+    server_main().unwrap();
+}
+
 #[actix_web::main]
-async fn main() -> std::io::Result<()> {
+async fn server_main() -> std::io::Result<()> {
     let mut directory = std::env::current_dir()?;
     let mut port = 8080u16;
     let args = std::env::args().collect::<Vec<String>>();
