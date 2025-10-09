@@ -21,67 +21,85 @@ fn calculate_hash(path: &Path) -> String {
     format!("{:x}", hasher.finish())
 }
 
-fn scan_packages_directory(directory: &Path) -> Result<RepositoryIndex, Box<dyn std::error::Error>> {
-    let mut packages = Vec::new();
+fn scan_packages_directory(directory: &Path) -> Result<MultiDistroRepository, Box<dyn std::error::Error>> {
+    let mut distros = Vec::new();
 
-    // Scan for .pax files directly in the packages directory
+    // Scan for subdirectories in the packages directory (each represents a distro)
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
 
-        if path.is_file() {
-            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                if file_name.ends_with(".pax") {
-                    let file_size = fs::metadata(&path)?.len();
+        if path.is_dir() {
+            if let Some(distro_name) = path.file_name().and_then(|n| n.to_str()) {
+                // Scan for .pax files in this distro directory
+                let mut packages = Vec::new();
 
-                    // Parse package information from filename
-                    // Expected format: name-version-arch.pax or name-version.pax
-                    let filename_without_ext = file_name.strip_suffix(".pax").unwrap_or(file_name);
+                for package_entry in fs::read_dir(&path)? {
+                    let package_entry = package_entry?;
+                    let package_path = package_entry.path();
 
-                    // Split by '-' to get components
-                    let parts: Vec<&str> = filename_without_ext.split('-').collect();
+                    if package_path.is_file() {
+                        if let Some(file_name) = package_path.file_name().and_then(|n| n.to_str()) {
+                            if file_name.ends_with(".pax") {
+                                let file_size = fs::metadata(&package_path)?.len();
 
-                    if parts.len() >= 2 {
-                        let pkg_name = parts[0];
-                        let pkg_version = parts[1];
-                        let architecture = if parts.len() >= 3 {
-                            match parts[2] {
-                                "x86_64" | "aarch64" | "arm64" => Some(parts[2].to_string()),
-                                _ => None,
+                                // Parse package information from filename
+                                // Expected format: name-version-arch.pax or name-version.pax
+                                let filename_without_ext = file_name.strip_suffix(".pax").unwrap_or(file_name);
+
+                                // Split by '-' to get components
+                                let parts: Vec<&str> = filename_without_ext.split('-').collect();
+
+                                if parts.len() >= 2 {
+                                    let pkg_name = parts[0];
+                                    let pkg_version = parts[1];
+                                    let architecture = if parts.len() >= 3 {
+                                        match parts[2] {
+                                            "x86_64" | "aarch64" | "arm64" => Some(parts[2].to_string()),
+                                            _ => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
+
+                                    packages.push(PackageEntry {
+                                        name: pkg_name.to_string(),
+                                        version: pkg_version.to_string(),
+                                        architecture,
+                                        description: format!("Package {} version {}", pkg_name, pkg_version),
+                                        dependencies: Vec::new(),
+                                        runtime_dependencies: Vec::new(),
+                                        provides: Vec::new(),
+                                        hash: calculate_hash(&package_path),
+                                        size: file_size,
+                                        download_url: format!("/packages/{}/{}", distro_name, file_name),
+                                        signature_url: format!("/packages/{}/{}.sig", distro_name, file_name),
+                                    });
+                                }
                             }
-                        } else {
-                            None
-                        };
-
-                        packages.push(PackageEntry {
-                            name: pkg_name.to_string(),
-                            version: pkg_version.to_string(),
-                            architecture,
-                            description: format!("Package {} version {}", pkg_name, pkg_version),
-                            dependencies: Vec::new(),
-                            runtime_dependencies: Vec::new(),
-                            provides: Vec::new(),
-                            hash: calculate_hash(&path),
-                            size: file_size,
-                            download_url: format!("/packages/{}", file_name),
-                            signature_url: format!("/packages/{}.sig", file_name),
-                        });
+                        }
                     }
+                }
+
+                // Generate metadata for this distro if it has packages
+                if !packages.is_empty() {
+                    let last_updated = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+
+                    distros.push(DistroRepository {
+                        name: distro_name.to_string(),
+                        packages,
+                        version: env!("CARGO_PKG_VERSION").to_string(),
+                        last_updated,
+                    });
                 }
             }
         }
     }
 
-    let last_updated = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    Ok(RepositoryIndex {
-        packages,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        last_updated,
-    })
+    Ok(MultiDistroRepository { distros })
 }
 
 fn yaml_file_to_package_metadata(path: &PathBuf) -> Option<PackageMetadata> {
@@ -96,8 +114,8 @@ async fn repository_metadata(
     data: web::Data<CoreData>,
 ) -> Result<HttpResponse, actix_web::Error> {
     match scan_packages_directory(&data.directory) {
-        Ok(index) => {
-            match serde_json::to_string(&index) {
+        Ok(multi_distro) => {
+            match serde_json::to_string(&multi_distro) {
                 Ok(body) => Ok(HttpResponse::with_body(StatusCode::OK, BoxBody::new(body))),
                 Err(_) => Err(InternalError::new(
                     "Error serializing repository index!",
@@ -112,15 +130,53 @@ async fn repository_metadata(
     }
 }
 
-#[get("/packages/{filename:.*}")]
+#[get("/repository/{distro}/metadata")]
+async fn distro_metadata(
+    distro: web::Path<String>,
+    data: web::Data<CoreData>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let distro_name = distro.into_inner();
+    match scan_packages_directory(&data.directory) {
+        Ok(multi_distro) => {
+            // Find the specific distro
+            for distro_repo in &multi_distro.distros {
+                if distro_repo.name == distro_name {
+                    let index = RepositoryIndex {
+                        packages: distro_repo.packages.clone(),
+                        version: distro_repo.version.clone(),
+                        last_updated: distro_repo.last_updated,
+                    };
+                    match serde_json::to_string(&index) {
+                        Ok(body) => return Ok(HttpResponse::with_body(StatusCode::OK, BoxBody::new(body))),
+                        Err(_) => return Err(InternalError::new(
+                            "Error serializing repository index!",
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                        ).into()),
+                    }
+                }
+            }
+            Err(InternalError::new(
+                "Distro not found!",
+                StatusCode::NOT_FOUND,
+            ).into())
+        }
+        Err(_) => Err(InternalError::new(
+            "Error scanning packages directory!",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ).into()),
+    }
+}
+
+#[get("/packages/{distro}/{filename:.*}")]
 async fn serve_package(
-    filename: web::Path<String>,
+    path: web::Path<(String, String)>,
     data: web::Data<CoreData>,
 ) -> Result<NamedFile, actix_web::Error> {
-    let filename = filename.into_inner();
+    let (distro, filename) = path.into_inner();
+    let file_path = format!("{}/{}", distro, filename);
 
     // Security check - ensure the file is within the packages directory
-    if let Some(safe_path) = path_check(&filename, &data.directory) {
+    if let Some(safe_path) = path_check(&file_path, &data.directory) {
         match actix_files::NamedFile::open(safe_path) {
             Ok(file) => Ok(file),
             Err(_) => Err(InternalError::new(
@@ -206,6 +262,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(web::Data::new(data.clone()))
             .service(repository_metadata)
+            .service(distro_metadata)
             .service(serve_package)
             .service(version)
     })
@@ -215,6 +272,19 @@ async fn main() -> std::io::Result<()> {
 }
 
 // Repository index structures for package manager compatibility
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiDistroRepository {
+    pub distros: Vec<DistroRepository>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistroRepository {
+    pub name: String,
+    pub packages: Vec<PackageEntry>,
+    pub version: String,
+    pub last_updated: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryIndex {
     pub packages: Vec<PackageEntry>,
