@@ -74,14 +74,21 @@ fn test_package_parsing() {
     }
 }
 
-// Helper function to calculate file hash (simple implementation)
+// Helper function to calculate file hash (SHA256 of file contents)
 fn calculate_hash(path: &Path) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
+    use sha2::{Sha256, Digest};
+    
+    match fs::read(path) {
+        Ok(contents) => {
+            let mut hasher = Sha256::new();
+            hasher.update(&contents);
+            format!("{:x}", hasher.finalize())
+        }
+        Err(e) => {
+            eprintln!("Error reading file {:?} for hash calculation: {}", path, e);
+            String::new()
+        }
+    }
 }
 
 fn scan_packages_directory(directory: &Path) -> Result<MultiDistroRepository, Box<dyn std::error::Error>> {
@@ -169,7 +176,6 @@ fn scan_packages_directory(directory: &Path) -> Result<MultiDistroRepository, Bo
                                         hash: calculate_hash(&package_path),
                                         size: file_size,
                                         download_url: format!("/packages/{}/{}", distro_name, file_name),
-                                        signature_url: format!("/packages/{}/{}.sig", distro_name, file_name),
                                     });
                                 }
                             }
@@ -305,6 +311,7 @@ async fn version() -> Result<HttpResponse, actix_web::Error> {
     ))
 }
 
+
 #[derive(Clone)]
 struct CoreData {
     directory: PathBuf,
@@ -413,7 +420,6 @@ pub struct PackageEntry {
     pub hash: String,
     pub size: u64,
     pub download_url: String,
-    pub signature_url: String,
 }
 
 // Detailed package metadata (from API)
